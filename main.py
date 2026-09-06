@@ -35,6 +35,156 @@ logger = logging.getLogger(__name__)
 ANALYSIS_MAX_ATTEMPTS = 3
 
 
+TITLE_FILTER_REASON_LABELS: dict[str, str] = {
+    "lead": "вакансии уровня Lead",
+    "team lead": "вакансии уровня Team Lead",
+    "teamlead": "вакансии уровня Team Lead",
+    "senior": "вакансии уровня Senior",
+    "fullstack": "Fullstack-вакансии",
+    "full stack": "Fullstack-вакансии",
+    "principal": "вакансии уровня Principal",
+    "staff": "вакансии уровня Staff",
+}
+
+
+ERROR_REASON_LABELS: dict[str, str] = {
+    "telegram_error": "ошибка отправки в Telegram",
+    "captcha_detected": "HH.ru запросил CAPTCHA",
+    "access_denied": "HH.ru отказал в доступе",
+    "vacancy_removed": "вакансия удалена или недоступна",
+    "page_structure_changed": "изменился интерфейс страницы HH.ru",
+    "network_error": "ошибка сети",
+    "cover_letter_failed": "не удалось создать сопроводительное письмо",
+    "approval_transition_failed": "не удалось подготовить вакансию к подтверждению",
+    "other_error": "техническая ошибка",
+}
+
+
+ANALYSIS_ERROR_LABELS: dict[str, str] = {
+    "authentication": "ошибка авторизации ИИ",
+    "permission": "нет доступа к ИИ",
+    "rate_limit": "превышен лимит запросов к ИИ",
+    "timeout": "тайм-аут ИИ-анализа",
+    "transient_server": "временная ошибка сервера ИИ",
+    "invalid_response": "ИИ вернул некорректный ответ",
+    "unsupported_capability": "ИИ не поддерживает требуемую функцию",
+    "configuration": "ошибка настройки ИИ",
+    "daily_limit": "исчерпан дневной лимит ИИ",
+    "no_available_keys": "нет доступных ключей ИИ",
+    "invalid_key": "некорректный ключ ИИ",
+    "duplicate_key": "дублирующийся ключ ИИ",
+    "llm_error": "ошибка ИИ",
+}
+
+
+CIRCUIT_REASON_LABELS: dict[str, str] = {
+    "page_structure_changed": "изменился интерфейс страницы HH.ru",
+    "technical_failure_ratio": "слишком много технических ошибок",
+    "search_errors": "несколько ошибок поиска подряд",
+}
+
+
+def _normalize_title_reason(reason: str) -> str:
+    normalized = (
+        reason.strip()
+        .replace("_", " ")
+        .replace("-", " ")
+    )
+
+    return " ".join(normalized.split()).casefold()
+
+
+def humanize_rejection_reason(reason: str) -> str:
+    raw_reason = reason.strip()
+
+    if not raw_reason:
+        return "не прошло фильтр"
+
+    reason_key = raw_reason.casefold()
+
+    if reason_key == "llm_rejected":
+        return "отклонено ИИ-анализом"
+
+    if reason_key == "filter_rejected":
+        return "не прошло фильтр по названию"
+
+    normalized_title_reason = _normalize_title_reason(raw_reason)
+
+    known_label = TITLE_FILTER_REASON_LABELS.get(normalized_title_reason)
+    if known_label:
+        return known_label
+
+    display_reason = " ".join(
+        raw_reason.replace("_", " ").split()
+    )
+
+    return f"фильтр по названию «{display_reason}»"
+
+
+def humanize_error_reason(reason: str) -> str:
+    raw_reason = reason.strip()
+
+    if not raw_reason:
+        return "техническая ошибка"
+
+    reason_key = raw_reason.casefold()
+
+    analysis_prefix = "analysis_failed:"
+
+    if reason_key.startswith(analysis_prefix):
+        error_type = reason_key[len(analysis_prefix):].strip()
+
+        return ANALYSIS_ERROR_LABELS.get(
+            error_type,
+            "ошибка ИИ-анализа",
+        )
+
+    return ERROR_REASON_LABELS.get(
+        reason_key,
+        "техническая ошибка",
+    )
+
+
+def humanize_circuit_reason(reason: str) -> str:
+    return CIRCUIT_REASON_LABELS.get(
+        reason.strip().casefold(),
+        "техническая проблема",
+    )
+
+
+def format_reason_summary(
+    rejection_reasons: Counter[str],
+    error_reasons: Counter[str],
+    *,
+    limit: int = 3,
+) -> str:
+    if limit <= 0:
+        return ""
+
+    humanized_reasons: Counter[str] = Counter()
+
+    for reason, count in rejection_reasons.items():
+        if count <= 0:
+            continue
+
+        humanized_reasons[
+            humanize_rejection_reason(reason)
+        ] += count
+
+    for reason, count in error_reasons.items():
+        if count <= 0:
+            continue
+
+        humanized_reasons[
+            humanize_error_reason(reason)
+        ] += count
+
+    return ", ".join(
+        f"{reason} — {count}"
+        for reason, count in humanized_reasons.most_common(limit)
+    )
+
+
 @dataclass(frozen=True)
 class VacancyProcessResult:
     outcome: str
@@ -67,22 +217,32 @@ class SearchRunStats:
     def record(self, result: VacancyProcessResult) -> None:
         if result.outcome == "rejected_by_filter":
             self.rejected_by_filter += 1
-            self.rejection_reasons[result.reason or "filter_rejected"] += 1
+            self.rejection_reasons[
+                result.reason or "filter_rejected"
+            ] += 1
+
         elif result.outcome == "rejected_by_llm":
             self.rejected_by_llm += 1
             self.rejection_reasons["llm_rejected"] += 1
+
         elif result.outcome == "telegram_card":
             self.telegram_cards += 1
+
         elif result.outcome == "other_error":
-            self.record_error(result.reason or "other_error")
+            self.record_error(
+                result.reason or "other_error"
+            )
 
         if result.page_state is None:
             return
+
         self.read_attempts += 1
+
         if result.page_state is PageState.PAGE_STRUCTURE_CHANGED:
             self.consecutive_page_errors += 1
         else:
             self.consecutive_page_errors = 0
+
         if result.page_state in {
             PageState.ACCESS_DENIED,
             PageState.CAPTCHA_DETECTED,
@@ -91,14 +251,20 @@ class SearchRunStats:
             self.technical_failures += 1
 
     def circuit_reason(self, settings: Settings) -> str:
-        if self.consecutive_page_errors >= settings.circuit_breaker_page_errors:
-            return "page_structure_changed"
         if (
-            self.read_attempts >= settings.circuit_breaker_min_sample
+            self.consecutive_page_errors
+            >= settings.circuit_breaker_page_errors
+        ):
+            return "page_structure_changed"
+
+        if (
+            self.read_attempts
+            >= settings.circuit_breaker_min_sample
             and self.technical_failures / self.read_attempts
             >= settings.circuit_breaker_unknown_ratio
         ):
             return "technical_failure_ratio"
+
         return ""
 
 
@@ -112,28 +278,53 @@ async def process_vacancy(
     *,
     now_factory: Callable[[], datetime] | None = None,
 ) -> VacancyProcessResult:
-    clock = now_factory or (lambda: datetime.now(UTC))
+    clock = now_factory or (
+        lambda: datetime.now(UTC)
+    )
+
     now = clock()
     existing = database.get(summary.id)
+
     if summary.previously_sent:
-        if existing is None or existing.status is not VacancyStatus.PENDING_APPROVAL:
+        if (
+            existing is None
+            or existing.status
+            is not VacancyStatus.PENDING_APPROVAL
+        ):
             return VacancyProcessResult("ignored")
+
         try:
-            await telegram.send_preview(existing, include_actions=True)
+            await telegram.send_preview(
+                existing,
+                include_actions=True,
+            )
         except TelegramAPIError:
-            return VacancyProcessResult("other_error", "telegram_error")
+            return VacancyProcessResult(
+                "other_error",
+                "telegram_error",
+            )
+
         return VacancyProcessResult("telegram_card")
+
     if existing is not None and (
         existing.status is not VacancyStatus.DISCOVERED
         or existing.llm_decision is not None
     ):
         return VacancyProcessResult("ignored")
-    details = await hh_client.read_vacancy(summary, telegram.request_captcha)
+
+    details = await hh_client.read_vacancy(
+        summary,
+        telegram.request_captcha,
+    )
+
     description_hash = (
-        hashlib.sha256(details.description.encode()).hexdigest()
+        hashlib.sha256(
+            details.description.encode()
+        ).hexdigest()
         if details.description
         else ""
     )
+
     if existing is None:
         if not database.discover(
             job_id=summary.id,
@@ -146,49 +337,99 @@ async def process_vacancy(
             discovered_at=now,
         ):
             return VacancyProcessResult("ignored")
-        logger.info("vacancy_discovered job_id=%s", summary.id)
+
+        logger.info(
+            "vacancy_discovered job_id=%s",
+            summary.id,
+        )
     else:
-        logger.info("vacancy_resumed job_id=%s", summary.id)
+        logger.info(
+            "vacancy_resumed job_id=%s",
+            summary.id,
+        )
+
     if details.state is not PageState.VACANCY_LOADED:
         error = details.error or details.state.value
+
         database.transition(
             summary.id,
             VacancyStatus.DISCOVERED,
             VacancyStatus.APPLY_FAILED,
             error_text=error,
         )
+
         if details.state is PageState.CAPTCHA_DETECTED:
-            await telegram.notify(f"CAPTCHA was not completed for vacancy {summary.id}.")
-        logger.error("vacancy_read_failed job_id=%s state=%s", summary.id, details.state.value)
-        return VacancyProcessResult("other_error", details.state.value, details.state)
+            await telegram.notify(
+                f"CAPTCHA was not completed for vacancy {summary.id}."
+            )
+
+        logger.error(
+            "vacancy_read_failed job_id=%s state=%s",
+            summary.id,
+            details.state.value,
+        )
+
+        return VacancyProcessResult(
+            "other_error",
+            details.state.value,
+            details.state,
+        )
 
     rejection = title_rejection_reason(
-        summary.title, settings.profile.candidate.excluded_positions
+        summary.title,
+        settings.profile.candidate.excluded_positions,
     )
+
     if rejection:
         database.transition(
             summary.id,
             VacancyStatus.DISCOVERED,
             VacancyStatus.REJECTED_BY_FILTER,
-            llm_reason=f"Title matched excluded term: {rejection}",
+            llm_reason=(
+                f"Title matched excluded term: {rejection}"
+            ),
         )
-        logger.info("vacancy_rejected job_id=%s source=filter", summary.id)
+
+        logger.info(
+            "vacancy_rejected job_id=%s source=filter",
+            summary.id,
+        )
+
         return VacancyProcessResult(
-            "rejected_by_filter", rejection, PageState.VACANCY_LOADED
+            "rejected_by_filter",
+            rejection,
+            PageState.VACANCY_LOADED,
         )
 
     try:
-        suitability = await analyzer.assess(summary.title, details.description)
+        suitability = await analyzer.assess(
+            summary.title,
+            details.description,
+        )
+
     except AnalysisError as exc:
         database.mark_analysis_failed(
             summary.id,
             error_type=exc.error_type,
             now=clock(),
-            retry_after=timedelta(minutes=settings.check_interval_minutes),
+            retry_after=timedelta(
+                minutes=settings.check_interval_minutes
+            ),
             max_attempts=ANALYSIS_MAX_ATTEMPTS,
         )
-        await telegram.notify_analysis_failed(summary.title, summary.url, exc.error_type)
-        logger.warning("vacancy_analysis_failed job_id=%s error_type=%s", summary.id, exc.error_type)
+
+        await telegram.notify_analysis_failed(
+            summary.title,
+            summary.url,
+            exc.error_type,
+        )
+
+        logger.warning(
+            "vacancy_analysis_failed job_id=%s error_type=%s",
+            summary.id,
+            exc.error_type,
+        )
+
         return VacancyProcessResult(
             "other_error",
             f"analysis_failed:{exc.error_type}",
@@ -205,18 +446,37 @@ async def process_vacancy(
             confidence=suitability.confidence,
             error_text="",
         )
-        logger.info("vacancy_rejected job_id=%s source=llm", summary.id)
-        return VacancyProcessResult(
-            "rejected_by_llm", suitability.reason, PageState.VACANCY_LOADED
+
+        logger.info(
+            "vacancy_rejected job_id=%s source=llm",
+            summary.id,
         )
 
-    fit_summary = normalize_fit_summary(suitability.fit_points)
-    company = await hh_client.read_company_details(details.company_url)
-    database.store_company_details(
-        summary.id, rating=company.rating, reviews_count=company.reviews_count
+        return VacancyProcessResult(
+            "rejected_by_llm",
+            suitability.reason,
+            PageState.VACANCY_LOADED,
+        )
+
+    fit_summary = normalize_fit_summary(
+        suitability.fit_points
     )
 
-    letter = await analyzer.generate_cover_letter(summary.title, details.description)
+    company = await hh_client.read_company_details(
+        details.company_url
+    )
+
+    database.store_company_details(
+        summary.id,
+        rating=company.rating,
+        reviews_count=company.reviews_count,
+    )
+
+    letter = await analyzer.generate_cover_letter(
+        summary.title,
+        details.description,
+    )
+
     if not letter.strip():
         database.transition(
             summary.id,
@@ -224,12 +484,21 @@ async def process_vacancy(
             VacancyStatus.APPLY_FAILED,
             error_text="cover_letter_failed",
         )
-        await telegram.notify_analysis_failed(summary.title, summary.url, "cover_letter_failed")
+
+        await telegram.notify_analysis_failed(
+            summary.title,
+            summary.url,
+            "cover_letter_failed",
+        )
+
         return VacancyProcessResult(
-            "other_error", "cover_letter_failed", PageState.VACANCY_LOADED
+            "other_error",
+            "cover_letter_failed",
+            PageState.VACANCY_LOADED,
         )
 
     include_actions = settings.app_mode != "dry_run"
+
     if settings.app_mode == "dry_run":
         database.store_analysis(
             summary.id,
@@ -239,6 +508,7 @@ async def process_vacancy(
             confidence=suitability.confidence,
             fit_summary=fit_summary,
         )
+
     elif not database.request_approval(
         job_id=summary.id,
         cover_letter=letter,
@@ -249,17 +519,28 @@ async def process_vacancy(
         now=now,
     ):
         return VacancyProcessResult(
-            "other_error", "approval_transition_failed", PageState.VACANCY_LOADED
+            "other_error",
+            "approval_transition_failed",
+            PageState.VACANCY_LOADED,
         )
+
     try:
         await telegram.send_preview(
-            database.get(summary.id), include_actions=include_actions
+            database.get(summary.id),
+            include_actions=include_actions,
         )
+
     except TelegramAPIError:
         return VacancyProcessResult(
-            "other_error", "telegram_error", PageState.VACANCY_LOADED
+            "other_error",
+            "telegram_error",
+            PageState.VACANCY_LOADED,
         )
-    return VacancyProcessResult("telegram_card", page_state=PageState.VACANCY_LOADED)
+
+    return VacancyProcessResult(
+        "telegram_card",
+        page_state=PageState.VACANCY_LOADED,
+    )
 
 
 async def run_search_cycle(
@@ -272,22 +553,33 @@ async def run_search_cycle(
     *,
     now_factory: Callable[[], datetime] | None = None,
 ) -> SearchRun:
-    now = now_factory or (lambda: datetime.now(UTC))
+    now = now_factory or (
+        lambda: datetime.now(UTC)
+    )
+
     started_at = now()
     stats = SearchRunStats()
     handled_ids: set[str] = set()
+
     state = "completed"
     circuit_reason = ""
     failure: Exception | None = None
+
     logger.info(
-        "search_cycle_started queries=%s", len(settings.profile.hh.search_queries)
+        "search_cycle_started queries=%s",
+        len(settings.profile.hh.search_queries),
     )
 
-    async def process(summary: VacancySummary) -> None:
+    async def process(
+        summary: VacancySummary,
+    ) -> None:
         nonlocal circuit_reason, state
+
         if summary.id in handled_ids:
             return
+
         handled_ids.add(summary.id)
+
         result = await process_vacancy(
             summary,
             settings,
@@ -297,21 +589,31 @@ async def run_search_cycle(
             telegram,
             now_factory=now,
         )
+
         stats.record(result)
-        circuit_reason = stats.circuit_reason(settings)
+
+        circuit_reason = stats.circuit_reason(
+            settings
+        )
+
         if circuit_reason:
             state = "paused_by_circuit_breaker"
+
             control.paused = True
             control.circuit_reason = circuit_reason
 
     try:
         database.expire_approved(now())
+
         database.requeue_due_analysis_failures(
-            now(), max_attempts=ANALYSIS_MAX_ATTEMPTS
+            now(),
+            max_attempts=ANALYSIS_MAX_ATTEMPTS,
         )
+
         for vacancy in database.unprocessed_discovered():
             if control.paused:
                 break
+
             await process(
                 VacancySummary(
                     vacancy.id,
@@ -320,65 +622,118 @@ async def run_search_cycle(
                     vacancy.search_query,
                 )
             )
+
         for query in settings.profile.hh.search_queries:
             if control.paused:
                 break
-            logger.info("search_query_started query=%r", query)
+
+            logger.info(
+                "search_query_started query=%r",
+                query,
+            )
+
             search = await hh_client.search_vacancies(
                 query,
                 settings.profile.hh.areas,
                 settings.profile.hh.experience_filters,
             )
+
             stats.query_count += 1
             stats.found_results += search.found_results
+
             stats.new_vacancies += sum(
-                not summary.previously_sent for summary in search.summaries
+                not summary.previously_sent
+                for summary in search.summaries
             )
+
             stats.duplicates += search.duplicates
+
             logger.info(
                 "search_query_finished query=%r found=%s new=%s duplicates=%s",
                 query,
                 search.found_results,
-                sum(not summary.previously_sent for summary in search.summaries),
+                sum(
+                    not summary.previously_sent
+                    for summary in search.summaries
+                ),
                 search.duplicates,
             )
+
             if search.error_reason:
-                stats.record_error(search.error_reason)
+                stats.record_error(
+                    search.error_reason
+                )
+
                 control.consecutive_search_errors += 1
             else:
                 control.consecutive_search_errors = 0
+
             if (
                 control.consecutive_search_errors
                 >= settings.circuit_breaker_page_errors
             ):
                 circuit_reason = "search_errors"
                 state = "paused_by_circuit_breaker"
+
                 control.paused = True
                 control.circuit_reason = circuit_reason
+
             for summary in search.summaries:
                 if control.paused:
                     break
+
                 await process(summary)
+
         if not control.paused:
-            await hh_client.check_messages(telegram.notify)
+            await hh_client.check_messages(
+                telegram.notify
+            )
+
     except Exception as exc:
         state = "failed"
-        stats.record_error(type(exc).__name__)
+
+        stats.record_error(
+            type(exc).__name__
+        )
+
         failure = exc
 
     if circuit_reason:
-        notification = (
-            f"Поиск приостановлен: {circuit_reason}. "
-            "Проверьте /diagnostics и выполните /resume после устранения причины."
+        readable_circuit_reason = (
+            humanize_circuit_reason(
+                circuit_reason
+            )
         )
-    elif state == "completed" and stats.telegram_cards == 0:
-        reasons = (stats.rejection_reasons + stats.error_reasons).most_common(3)
-        reason_text = ", ".join(f"{name}={count}" for name, count in reasons)
+
         notification = (
-            f"Цикл завершён: найдено {stats.found_results}, "
-            f"новых {stats.new_vacancies}, карточек: 0."
-            + (f" Причины: {reason_text}." if reason_text else "")
+            f"Поиск приостановлен: "
+            f"{readable_circuit_reason}. "
+            "Проверьте /diagnostics и выполните "
+            "/resume после устранения причины."
         )
+
+    elif (
+        state == "completed"
+        and stats.telegram_cards == 0
+    ):
+        reason_text = format_reason_summary(
+            stats.rejection_reasons,
+            stats.error_reasons,
+            limit=3,
+        )
+
+        notification = (
+            f"Цикл завершён: "
+            f"найдено {stats.found_results}, "
+            f"новых {stats.new_vacancies}, "
+            f"карточек: 0."
+        )
+
+        if reason_text:
+            notification += (
+                f"\nПричины: {reason_text}."
+            )
+
     else:
         notification = ""
 
@@ -394,27 +749,45 @@ async def run_search_cycle(
         rejected_by_llm=stats.rejected_by_llm,
         telegram_cards=stats.telegram_cards,
         error_count=stats.error_count,
-        rejection_reasons=dict(stats.rejection_reasons),
-        error_reasons=dict(stats.error_reasons),
+        rejection_reasons=dict(
+            stats.rejection_reasons
+        ),
+        error_reasons=dict(
+            stats.error_reasons
+        ),
         last_safe_error=stats.last_safe_error,
         circuit_reason=circuit_reason,
     )
+
     if failure is not None:
         raise failure
+
     if notification:
         try:
-            await telegram.notify(notification)
+            await telegram.notify(
+                notification
+            )
+
         except TelegramAPIError:
-            database.record_search_run_error(run_id, "telegram_error")
+            database.record_search_run_error(
+                run_id,
+                "telegram_error",
+            )
+
     result = database.latest_search_run()
+
     if result is None:
-        raise RuntimeError("search run was not saved")
+        raise RuntimeError(
+            "search run was not saved"
+        )
+
     logger.info(
         "search_cycle_finished state=%s cards=%s errors=%s",
         result.state,
         result.telegram_cards,
         result.error_count,
     )
+
     return result
 
 
@@ -428,16 +801,24 @@ async def retry_due_analyses(
     *,
     now_factory: Callable[[], datetime] | None = None,
 ) -> None:
-    clock = now_factory or (lambda: datetime.now(UTC))
-    now = clock()
-    # ponytail: one worker owns this lifecycle; add per-row claims if
-    # multi-worker deployments matter.
-    database.requeue_due_analysis_failures(
-        now, max_attempts=ANALYSIS_MAX_ATTEMPTS
+    clock = now_factory or (
+        lambda: datetime.now(UTC)
     )
+
+    now = clock()
+
+    # ponytail: one worker owns this lifecycle;
+    # add per-row claims if multi-worker
+    # deployments matter.
+    database.requeue_due_analysis_failures(
+        now,
+        max_attempts=ANALYSIS_MAX_ATTEMPTS,
+    )
+
     for vacancy in database.unprocessed_discovered():
         if control.paused:
             break
+
         await process_vacancy(
             VacancySummary(
                 vacancy.id,
@@ -465,92 +846,198 @@ async def agent_loop(
     while True:
         if not control.paused:
             run = await run_search_cycle(
-                settings, database, hh_client, analyzer, telegram, control
+                settings,
+                database,
+                hh_client,
+                analyzer,
+                telegram,
+                control,
             )
+
             control.next_run_at = (
                 None
                 if control.paused
-                else datetime.fromisoformat(run.finished_at)
-                + timedelta(minutes=settings.check_interval_minutes)
+                else datetime.fromisoformat(
+                    run.finished_at
+                )
+                + timedelta(
+                    minutes=settings.check_interval_minutes
+                )
             )
+
         else:
             control.next_run_at = None
+
         try:
             await asyncio.wait_for(
-                control.wake_event.wait(), settings.check_interval_minutes * 60
+                control.wake_event.wait(),
+                settings.check_interval_minutes * 60,
             )
+
         except TimeoutError:
             pass
+
         finally:
             control.wake_event.clear()
             control.next_run_at = None
 
 
 async def run(settings: Settings) -> None:
-    database = Database(settings.database_path)
-    database.init()
-    backend = create_browser_backend(settings)
-    llm_provider = create_llm_provider(settings, database)
-    mistral_keys = (
-        llm_provider if isinstance(llm_provider, MistralKeyManager) else None
+    database = Database(
+        settings.database_path
     )
+
+    database.init()
+
+    backend = create_browser_backend(
+        settings
+    )
+
+    llm_provider = create_llm_provider(
+        settings,
+        database,
+    )
+
+    mistral_keys = (
+        llm_provider
+        if isinstance(
+            llm_provider,
+            MistralKeyManager,
+        )
+        else None
+    )
+
     telegram: TelegramService | None = None
+
     try:
         context = await backend.start()
-        guard = ApprovalGuard(settings, database)
-        hh_client = HHClient(context, settings, database, guard)
+
+        guard = ApprovalGuard(
+            settings,
+            database,
+        )
+
+        hh_client = HHClient(
+            context,
+            settings,
+            database,
+            guard,
+        )
+
         if not await hh_client.ensure_login():
             raise RuntimeError(
-                "HH.ru login is required. Run with BROWSER_HEADLESS=false and sign in manually."
+                "HH.ru login is required. "
+                "Run with BROWSER_HEADLESS=false "
+                "and sign in manually."
             )
+
         control = AgentControl()
-        approval_service = ApprovalService(settings, database, hh_client)
-        telegram = TelegramService(
-            settings, database, approval_service, control, mistral_keys=mistral_keys
+
+        approval_service = ApprovalService(
+            settings,
+            database,
+            hh_client,
         )
-        analyzer = VacancyAnalyzer(settings, llm_provider)
+
+        telegram = TelegramService(
+            settings,
+            database,
+            approval_service,
+            control,
+            mistral_keys=mistral_keys,
+        )
+
+        analyzer = VacancyAnalyzer(
+            settings,
+            llm_provider,
+        )
+
         if mistral_keys is not None:
-            mistral_keys.set_notifier(telegram.notify)
-        if hasattr(telegram, "check_updates"):
-            asyncio.create_task(telegram.check_updates(notify=True))
+            mistral_keys.set_notifier(
+                telegram.notify
+            )
+
+        if hasattr(
+            telegram,
+            "check_updates",
+        ):
+            asyncio.create_task(
+                telegram.check_updates(
+                    notify=True
+                )
+            )
+
         await asyncio.gather(
             telegram.start_polling(),
-            agent_loop(settings, database, hh_client, analyzer, telegram, control),
+            agent_loop(
+                settings,
+                database,
+                hh_client,
+                analyzer,
+                telegram,
+                control,
+            ),
         )
+
     finally:
         try:
             if telegram is not None:
                 await telegram.stop()
+
         finally:
             try:
                 await llm_provider.close()
+
             finally:
                 await backend.close()
 
 
 async def check_llm(
     settings: Settings,
-    provider_factory: Callable[[Settings, Database], LLMProvider] = create_llm_provider,
+    provider_factory: Callable[
+        [Settings, Database],
+        LLMProvider,
+    ] = create_llm_provider,
 ) -> None:
-    database = Database(settings.database_path)
+    database = Database(
+        settings.database_path
+    )
+
     database.init()
-    provider = provider_factory(settings, database)
+
+    provider = provider_factory(
+        settings,
+        database,
+    )
+
     try:
         response = await provider.generate_text(
             LLMRequest(
-                system_instructions="Return only the word OK.",
+                system_instructions=(
+                    "Return only the word OK."
+                ),
                 user_content="Reply OK.",
                 model=settings.llm.model,
                 temperature=0,
-                max_output_tokens=min(settings.llm.max_output_tokens, 8),
-                timeout_seconds=settings.llm.timeout_seconds,
+                max_output_tokens=min(
+                    settings.llm.max_output_tokens,
+                    8,
+                ),
+                timeout_seconds=(
+                    settings.llm.timeout_seconds
+                ),
                 operation="healthcheck",
             )
         )
+
         print(
-            f"LLM check: provider={response.provider} model={response.model} "
-            f"latency_ms={response.latency_ms} success=true"
+            f"LLM check: "
+            f"provider={response.provider} "
+            f"model={response.model} "
+            f"latency_ms={response.latency_ms} "
+            f"success=true"
         )
+
     finally:
         await provider.close()
 
@@ -558,50 +1045,118 @@ async def check_llm(
 def cli(
     argv: list[str] | None = None,
     *,
-    provider_factory: Callable[[Settings, Database], LLMProvider] = create_llm_provider,
+    provider_factory: Callable[
+        [Settings, Database],
+        LLMProvider,
+    ] = create_llm_provider,
 ) -> int:
-    parser = argparse.ArgumentParser(description="Safe personal HH assistant")
+    parser = argparse.ArgumentParser(
+        description="Safe personal HH assistant"
+    )
+
     parser.add_argument(
         "--version",
         action="version",
         version=f"HH Agent v{__version__}",
     )
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
-    parser.add_argument("--profile", type=Path)
-    parser.add_argument("--check-config", action="store_true")
-    parser.add_argument("--check-llm", action="store_true")
+
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+    )
+
+    parser.add_argument(
+        "--profile",
+        type=Path,
+    )
+
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--check-llm",
+        action="store_true",
+    )
+
     args = parser.parse_args(argv)
+
     try:
-        settings = load_settings(args.env_file, args.profile)
+        settings = load_settings(
+            args.env_file,
+            args.profile,
+        )
+
     except ConfigError as exc:
-        print(exc, file=sys.stderr)
+        print(
+            exc,
+            file=sys.stderr,
+        )
+
         return 2
+
     if args.check_config:
         print(
-            f"Configuration valid: mode={settings.app_mode}, "
+            f"Configuration valid: "
+            f"mode={settings.app_mode}, "
             f"browser={settings.browser_backend}"
         )
+
         return 0
+
     if args.check_llm:
         try:
-            asyncio.run(check_llm(settings, provider_factory))
+            asyncio.run(
+                check_llm(
+                    settings,
+                    provider_factory,
+                )
+            )
+
         except LLMError as exc:
             print(
-                f"LLM check failed: provider={settings.llm.provider} "
+                f"LLM check failed: "
+                f"provider={settings.llm.provider} "
                 f"error_type={exc.category}",
                 file=sys.stderr,
             )
+
             return 1
+
         return 0
-    configure_logging(settings.log_path)
+
+    configure_logging(
+        settings.log_path
+    )
+
     try:
-        asyncio.run(run(settings))
-    except (BrowserLaunchError, RuntimeError) as exc:
-        logger.error("startup_failed error=%s", exc)
-        print(exc, file=sys.stderr)
+        asyncio.run(
+            run(settings)
+        )
+
+    except (
+        BrowserLaunchError,
+        RuntimeError,
+    ) as exc:
+        logger.error(
+            "startup_failed error=%s",
+            exc,
+        )
+
+        print(
+            exc,
+            file=sys.stderr,
+        )
+
         return 1
+
     except KeyboardInterrupt:
-        logger.info("agent_stopped")
+        logger.info(
+            "agent_stopped"
+        )
+
     return 0
 
 

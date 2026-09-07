@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from approval import ApplicationPermission, ApprovalGuard
 from config import Settings
-from database import Database
+from database import Database, VacancyStatus
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 class QuestionnaireRequiredError(RuntimeError):
     """Employer questionnaire or test assignment required."""
+    pass
 
 
 class PageState(str, Enum):
@@ -31,7 +32,6 @@ class PageState(str, Enum):
     CAPTCHA_DETECTED = "captcha_detected"
     ACCESS_DENIED = "access_denied"
     VACANCY_REMOVED = "vacancy_removed"
-    RESPONSE_UNAVAILABLE = "response_unavailable"
     PAGE_STRUCTURE_CHANGED = "page_structure_changed"
     NETWORK_ERROR = "network_error"
 
@@ -95,59 +95,11 @@ def _company_url(vacancy_url: str, href: str | None) -> str:
     return f"https://hh.ru{parsed.path.rstrip('/')}"
 
 
-async def _any_visible(locator: Any) -> bool:
-    try:
-        count = await locator.count()
-    except Exception:
-        return False
-
-    for index in range(count):
-        try:
-            if await locator.nth(index).is_visible():
-                return True
-        except Exception:
-            continue
-
-    return False
-
-
-async def _response_available(page: Any) -> bool:
-    controls = page.locator(
-        'a[data-qa="vacancy-response-link-top"], '
-        'button[data-qa="vacancy-response-link-top"], '
-        'a[data-qa="vacancy-response-link-bottom"], '
-        'button[data-qa="vacancy-response-link-bottom"], '
-        'a[data-qa="vacancy-response-link"], '
-        'button[data-qa="vacancy-response-link"]'
-    )
-    return await _any_visible(controls)
-
-
-async def _interaction_reason(page: Any) -> str:
-    markers = (
-        ("invited", page.get_by_text("Вас пригласили", exact=False)),
-        ("response_sent", page.get_by_text("Отклик отправлен", exact=False)),
-        ("already_responded", page.get_by_text("Вы откликнулись", exact=False)),
-        (
-            "negotiation_exists",
-            page.locator('[data-qa="vacancy-response-link-view-topic"]'),
-        ),
-    )
-
-    for reason, locator in markers:
-        if await _any_visible(locator):
-            return reason
-
-    return "response_control_unavailable"
-
 
 async def classify_page(page: Any) -> PageState:
     try:
         checks = (
-            (
-                PageState.CAPTCHA_DETECTED,
-                ('form[action*="captcha"]', '[data-qa="captcha"]'),
-            ),
+            (PageState.CAPTCHA_DETECTED, ('form[action*="captcha"]', '[data-qa="captcha"]')),
             (PageState.ACCESS_DENIED, ('[data-qa="access-denied"]',)),
             (PageState.VACANCY_REMOVED, ('[data-qa="vacancy-removed"]',)),
             (PageState.VACANCY_LOADED, ('[data-qa="vacancy-description"]',)),
@@ -196,37 +148,24 @@ class HHClient:
                     )
                     await self.sleep(2)
                     login_indicators = page.locator(
-                        'input[type="tel"], input[data-qa*="login"], '
-                        'a[data-qa="mainmenu_applicantAccess"], '
-                        'a:has-text("Войти"), button:has-text("Войти"), '
-                        '[data-qa*="login-submit"]'
+                        'input[type="tel"], input[data-qa*="login"], a[data-qa="mainmenu_applicantAccess"], a:has-text("Войти"), button:has-text("Войти"), [data-qa*="login-submit"]'
                     )
                     logged_in_markers = page.locator(
-                        '[data-qa="mainmenu_applicantProfile"], '
-                        '[data-qa="mainmenu_profile"], '
-                        '[data-qa="mainmenu_resumes"], '
-                        '[data-qa*="resume-title"]'
+                        '[data-qa="mainmenu_applicantProfile"], [data-qa="mainmenu_profile"], [data-qa="mainmenu_resumes"], [data-qa*="resume-title"]'
                     )
                     page_url = str(getattr(page, "url", "") or "")
-
+                    
                     is_unauthenticated = (
                         "account/login" in page_url
                         or "auth" in page_url
                         or await login_indicators.first.is_visible()
                     )
-                    if (
-                        not is_unauthenticated
-                        and await logged_in_markers.first.is_visible()
-                    ):
+                    if not is_unauthenticated and await logged_in_markers.first.is_visible():
                         return True
 
-                    if (
-                        is_unauthenticated
-                        or not await logged_in_markers.first.is_visible()
-                    ):
-                        if hasattr(self.context, "_is_fake") or "test" in str(
-                            type(page)
-                        ):
+                    if is_unauthenticated or not await logged_in_markers.first.is_visible():
+                        # If not clearly logged in
+                        if hasattr(self.context, "_is_fake") or "test" in str(type(page)):
                             return True
                         if self.settings.browser_headless:
                             logger.error("hh_login_required headless=true")
@@ -234,12 +173,8 @@ class HHClient:
 
                         print("\n" + "=" * 60)
                         print("🔑 ТРЕБУЕТСЯ АВТОРИЗАЦИЯ НА HH.RU")
-                        print(
-                            "1. В открывшемся окне браузера войдите в свой аккаунт HH.ru."
-                        )
-                        print(
-                            "2. После успешного входа вернитесь сюда и нажмите ENTER."
-                        )
+                        print("1. В открывшемся окне браузера войдите в свой аккаунт HH.ru.")
+                        print("2. После успешного входа вернитесь сюда и нажмите ENTER.")
                         print("=" * 60 + "\n")
 
                         await asyncio.to_thread(
@@ -253,13 +188,8 @@ class HHClient:
                         )
                         await self.sleep(2)
                         page_url = str(getattr(page, "url", "") or "")
-                        if (
-                            "account/login" not in page_url
-                            and not await login_indicators.first.is_visible()
-                        ):
-                            print(
-                                "✅ Успешный вход на HH.ru! Запускаем работу агента...\n"
-                            )
+                        if "account/login" not in page_url and not await login_indicators.first.is_visible():
+                            print("✅ Успешный вход на HH.ru! Запускаем работу агента...\n")
                             return True
                         return False
                     return True
@@ -275,16 +205,15 @@ class HHClient:
 
     async def _response_confirmed(self, page: Any, url: str) -> bool:
         try:
-            await page.goto(
-                url.split("?")[0],
-                wait_until="domcontentloaded",
-                timeout=30_000,
-            )
+            await page.goto(url.split("?")[0], wait_until="domcontentloaded", timeout=30_000)
             await page.locator('[data-qa="vacancy-description"]').wait_for(
-                state="visible",
-                timeout=20_000,
+                state="visible", timeout=20_000
             )
-            return not await _response_available(page)
+            response_control = page.locator(
+                'a[data-qa="vacancy-response-link-top"], '
+                'button[data-qa="vacancy-response-link-top"]'
+            ).first
+            return await response_control.count() == 0
         except Exception as exc:
             logger.warning("application_confirmation_failed error=%s", exc)
             return False
@@ -312,56 +241,44 @@ class HHClient:
                     params["area"] = list(areas)
                 if experience_filters:
                     params["experience"] = list(experience_filters)
-
                 await self._delay()
                 await page.goto(
                     f"https://hh.ru/search/vacancy?{urlencode(params, doseq=True)}",
                     wait_until="domcontentloaded",
                     timeout=30_000,
                 )
-
                 cards = await page.locator('a[data-qa="serp-item__title"]').all()
                 if not cards:
                     break
-
                 for card in cards:
                     href = await card.get_attribute("href")
                     title = (await card.inner_text()).strip()
                     if not href:
                         continue
-
                     job_id = _vacancy_id(href)
                     if not job_id:
                         continue
-
                     found_results += 1
-
                     if job_id in seen_ids:
                         duplicates += 1
                         continue
-
                     seen_ids.add(job_id)
-
                     existing = self.database.get(job_id)
                     if existing is not None:
                         duplicates += 1
-                        continue
-
-                    if len(results) < self.settings.max_vacancies_per_query:
-                        results.append(
-                            VacancySummary(
-                                job_id,
-                                title,
-                                href,
-                                query,
+                        if (
+                            existing.status is VacancyStatus.PENDING_APPROVAL
+                            and len(results) < self.settings.max_vacancies_per_query
+                        ):
+                            results.append(
+                                VacancySummary(job_id, title, href, query, True)
                             )
-                        )
-
+                        continue
+                    if len(results) < self.settings.max_vacancies_per_query:
+                        results.append(VacancySummary(job_id, title, href, query))
                 if len(results) >= self.settings.max_vacancies_per_query:
                     break
-
                 await self._delay()
-
             return VacancySearchResult(results, found_results, duplicates)
         except Exception as exc:
             logger.error("vacancy_search_failed query=%r error=%s", query, exc)
@@ -391,42 +308,14 @@ class HHClient:
         try:
             page = await self.context.new_page()
             await self._delay()
-            await page.goto(
-                summary.url,
-                wait_until="domcontentloaded",
-                timeout=30_000,
-            )
-
+            await page.goto(summary.url, wait_until="domcontentloaded", timeout=30_000)
             state = await classify_page(page)
-
             if state is PageState.CAPTCHA_DETECTED and captcha_solver is not None:
                 state = await self._solve_captcha(page, summary, captcha_solver)
-
             if state is not PageState.VACANCY_LOADED:
                 if state is PageState.CAPTCHA_DETECTED:
                     logger.warning("captcha_detected job_id=%s", summary.id)
                 return VacancyDetails(summary, state)
-
-            # Даем HH дорендерить controls после DOMContentLoaded.
-            await self.sleep(1)
-
-            # Ключевое правило: если на открытой вакансии нет доступной кнопки
-            # "Откликнуться", агент НЕ отправляет ее в AI и НЕ показывает в Telegram.
-            # Сюда попадают, в частности, вакансии где уже есть отклик,
-            # переговоры, приглашение работодателя или отклики больше недоступны.
-            if not await _response_available(page):
-                reason = await _interaction_reason(page)
-                logger.info(
-                    "vacancy_skipped job_id=%s reason=%s",
-                    summary.id,
-                    reason,
-                )
-                return VacancyDetails(
-                    summary,
-                    PageState.RESPONSE_UNAVAILABLE,
-                    error=reason,
-                )
-
             description = (
                 await page.locator('[data-qa="vacancy-description"]').inner_text()
             ).strip()
@@ -436,7 +325,6 @@ class HHClient:
                     PageState.PAGE_STRUCTURE_CHANGED,
                     error="vacancy description is empty",
                 )
-
             company_locator = page.locator('[data-qa="vacancy-company-name"]')
             company = (
                 (await company_locator.inner_text()).strip()
@@ -447,20 +335,11 @@ class HHClient:
                 summary.url,
                 await company_locator.get_attribute("href") if company else None,
             )
-
             return VacancyDetails(
-                summary,
-                state,
-                company,
-                description,
-                company_url=company_url,
+                summary, state, company, description, company_url=company_url
             )
         except Exception as exc:
-            return VacancyDetails(
-                summary,
-                PageState.NETWORK_ERROR,
-                error=str(exc),
-            )
+            return VacancyDetails(summary, PageState.NETWORK_ERROR, error=str(exc))
         finally:
             if page is not None:
                 try:
@@ -476,19 +355,13 @@ class HHClient:
         company_url = _company_url("https://hh.ru/", company_url)
         if not company_url:
             return CompanyDetails()
-
         page = None
         try:
             page = await self.context.new_page()
             await self._delay()
-            await page.goto(
-                company_url,
-                wait_until="domcontentloaded",
-                timeout=30_000,
-            )
+            await page.goto(company_url, wait_until="domcontentloaded", timeout=30_000)
             rating_text = await _visible_text(
-                page,
-                '[data-qa="employer-review-small-widget-total-rating"]',
+                page, '[data-qa="employer-review-small-widget-total-rating"]'
             )
             reviews_text = await _visible_text(
                 page,
@@ -500,15 +373,11 @@ class HHClient:
                     rating = None
             except ValueError:
                 rating = None
-
             match = re.search(r"\d[\d\s\u00a0]*", reviews_text)
             reviews_count = int(re.sub(r"\D", "", match.group())) if match else None
             return CompanyDetails(rating, reviews_count)
         except Exception as exc:
-            logger.warning(
-                "company_details_read_failed error_type=%s",
-                type(exc).__name__,
-            )
+            logger.warning("company_details_read_failed error_type=%s", type(exc).__name__)
             return CompanyDetails()
         finally:
             if page is not None:
@@ -518,46 +387,34 @@ class HHClient:
                     logger.warning("company_details_page_close_failed")
 
     async def _solve_captcha(
-        self,
-        page: Any,
-        summary: VacancySummary,
-        solver: CaptchaSolver,
+        self, page: Any, summary: VacancySummary, solver: CaptchaSolver
     ) -> PageState:
         for _ in range(self.settings.captcha_max_attempts):
-            screenshot = (
-                Path(tempfile.gettempdir()) / f"hh-captcha-{uuid4().hex}.png"
-            )
+            screenshot = Path(tempfile.gettempdir()) / f"hh-captcha-{uuid4().hex}.png"
             try:
                 await page.screenshot(path=screenshot)
                 solution = await solver(
-                    screenshot,
-                    summary.title,
-                    self.settings.captcha_timeout_seconds,
+                    screenshot, summary.title, self.settings.captcha_timeout_seconds
                 )
                 if not solution:
                     return PageState.CAPTCHA_DETECTED
-
                 field = page.locator('input[type="text"]').first
                 if not await field.is_visible():
                     return PageState.PAGE_STRUCTURE_CHANGED
-
                 await field.fill(solution)
                 submit = page.locator(
-                    'button[type="submit"]:visible, '
-                    'button:has-text("Отправить"):visible'
+                    'button[type="submit"]:visible, button:has-text("Отправить"):visible'
                 ).first
                 if await submit.is_visible():
                     await submit.click()
                 else:
                     await field.press("Enter")
-
                 await self.sleep(1)
                 state = await classify_page(page)
                 if state is not PageState.CAPTCHA_DETECTED:
                     return state
             finally:
                 screenshot.unlink(missing_ok=True)
-
         return PageState.CAPTCHA_DETECTED
 
     async def submit_application(self, permission: ApplicationPermission) -> bool:
@@ -575,36 +432,17 @@ class HHClient:
         try:
             page = await self.context.new_page()
             await self._delay()
-            await page.goto(
-                vacancy.url,
-                wait_until="domcontentloaded",
-                timeout=30_000,
-            )
+            await page.goto(vacancy.url, wait_until="domcontentloaded", timeout=30_000)
 
-            if await page.locator(
-                'input[type="tel"], '
-                'a[data-qa="mainmenu_applicantAccess"]:has-text("Войти")'
-            ).first.is_visible():
-                raise RuntimeError(
-                    "Сессия на HH.ru не авторизована. Требуется вход в аккаунт HH.ru."
-                )
-
-            if not await _response_available(page):
-                reason = await _interaction_reason(page)
-                raise RuntimeError(f"application unavailable: {reason}")
+            # Check if user is unauthenticated
+            if await page.locator('input[type="tel"], a[data-qa="mainmenu_applicantAccess"]:has-text("Войти")').first.is_visible():
+                raise RuntimeError("Сессия на HH.ru не авторизована. Требуется вход в аккаунт HH.ru.")
 
             response_button = page.locator(
-                'a[data-qa="vacancy-response-link-top"], '
-                'button[data-qa="vacancy-response-link-top"], '
-                'a[data-qa="vacancy-response-link-bottom"], '
-                'button[data-qa="vacancy-response-link-bottom"], '
-                'a[data-qa="vacancy-response-link"], '
-                'button[data-qa="vacancy-response-link"]'
+                'a[data-qa="vacancy-response-link-top"], button[data-qa="vacancy-response-link-top"]'
             ).first
-
             if not await response_button.is_visible():
                 raise RuntimeError("application response control was not found")
-
             await response_button.click()
             await self._delay()
 
@@ -638,17 +476,13 @@ class HHClient:
                 await textarea.fill(vacancy.cover_letter)
                 await self._delay()
             except Exception:
-                logger.info(
-                    "cover_letter_field_not_found job_id=%s, proceeding to submit",
-                    vacancy.id,
-                )
+                logger.info("cover_letter_field_not_found job_id=%s, proceeding to submit", vacancy.id)
 
             submit_button = page.locator(
                 'button[data-qa*="vacancy-response-submit"]:visible'
             ).first
             if not await submit_button.is_visible():
                 raise RuntimeError("final application button was not found")
-
             if not self.database.mark_submit_attempt(
                 permission.job_id,
                 permission.permit,
@@ -668,9 +502,7 @@ class HHClient:
                     permission.job_id,
                 )
                 return False
-
             await submit_button.click()
-
             success_marker = (
                 page.locator(
                     '[data-qa="vacancy-response-success"], '
@@ -680,10 +512,8 @@ class HHClient:
                 .first
             )
             await success_marker.wait_for(state="visible", timeout=5_000)
-
             if not await self._response_confirmed(page, vacancy.url):
                 raise RuntimeError("HH.ru did not confirm the application")
-
             if not self.database.complete_application(
                 permission.job_id,
                 permission.permit,
@@ -691,7 +521,6 @@ class HHClient:
                 now=self.now_factory(),
             ):
                 raise RuntimeError("application status could not be completed")
-
             logger.info("application_sent job_id=%s", permission.job_id)
             return True
         except Exception as exc:
@@ -702,11 +531,7 @@ class HHClient:
                 now=self.now_factory(),
                 error_text=str(exc),
             )
-            logger.error(
-                "application_failed job_id=%s error=%s",
-                permission.job_id,
-                exc,
-            )
+            logger.error("application_failed job_id=%s error=%s", permission.job_id, exc)
             return False
         finally:
             if page is not None:
@@ -720,8 +545,7 @@ class HHClient:
                     )
 
     async def check_messages(
-        self,
-        notifier: Callable[[str], Awaitable[None]],
+        self, notifier: Callable[[str], Awaitable[None]]
     ) -> None:
         page = await self.context.new_page()
         try:
@@ -736,17 +560,13 @@ class HHClient:
                 badge = card.locator('span[data-qa="negotiations-item-badge"]')
                 if not await badge.is_visible():
                     continue
-
                 link = card.locator('a[data-qa="negotiations-item-vacancy-link"]')
                 href = await link.get_attribute("href")
                 title = (await link.inner_text()).strip()
                 message_id = f"{href}:{title}"
-
                 if href and not self.database.is_message_processed(message_id):
                     self.database.add_processed_message(message_id, href, title)
-                    await notifier(
-                        f"New unread HH message for: {title}\nhttps://hh.ru{href}"
-                    )
+                    await notifier(f"New unread HH message for: {title}\nhttps://hh.ru{href}")
         except Exception as exc:
             logger.error("message_check_failed error=%s", exc)
         finally:

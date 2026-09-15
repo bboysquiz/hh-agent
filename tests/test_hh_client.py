@@ -512,7 +512,8 @@ def test_captcha_solution_uses_submit_button(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("title", "excluded", "expected"),
     [
-        ("Senior Python developer", (), "senior"),
+        ("Senior Python developer", (), None),
+        ("Сеньор Vue-разработчик", (), None),
         ("Python sales engineer", ("sales",), "sales"),
         ("Python developer", (), None),
     ],

@@ -21,6 +21,7 @@ CANDIDATE_FULL_NAME = "Сквирский Никита Владимирович"
 CANDIDATE_PHONE = "+7 (911) 7985687"
 CANDIDATE_EMAIL = "skvirskii.nikita@gmail.com"
 CANDIDATE_TELEGRAM = "@bboysquiz"
+CANDIDATE_PORTFOLIO = "https://portfolio-squiz.amvera.io/"
 
 
 class SuitabilityResult(BaseModel):
@@ -32,7 +33,7 @@ class SuitabilityResult(BaseModel):
 
     suitable: bool
     confidence: float = Field(ge=0, le=1)
-    reason: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=1000)
     fit_points: list[dict[str, Any]] | None = None
 
     @field_validator("fit_points", mode="before")
@@ -187,6 +188,7 @@ class VacancyAnalyzer:
         candidate["contact_phone"] = CANDIDATE_PHONE
         candidate["contact_email"] = CANDIDATE_EMAIL
         candidate["contact_telegram"] = CANDIDATE_TELEGRAM
+        candidate["contact_portfolio"] = CANDIDATE_PORTFOLIO
 
         return candidate
 
@@ -273,8 +275,11 @@ class VacancyAnalyzer:
                 suitable=False,
                 confidence=1.0,
                 reason=(
-                    "В описании вакансии нет явного указания "
-                    "на frontend-разработку."
+                    "В описании не найдены явные обязанности по "
+                    "frontend-разработке: созданию пользовательских или "
+                    "веб-интерфейсов и работе с клиентской частью приложения. "
+                    "Одного упоминания отдельных веб-технологий недостаточно, "
+                    "чтобы считать эту позицию целевой frontend-вакансией."
                 ),
                 fit_points=None,
             )
@@ -293,8 +298,10 @@ class VacancyAnalyzer:
                 suitable=False,
                 confidence=1.0,
                 reason=(
-                    "В описании вакансии явно не указан "
-                    "Vue, Nuxt или Quasar."
+                    "В описании есть признаки frontend-разработки, но Vue, "
+                    "Nuxt или Quasar не указаны как часть рабочего стека. "
+                    "Поскольку поиск ориентирован именно на Vue-экосистему, "
+                    "совпадения по основному целевому стеку недостаточно."
                 ),
                 fit_points=None,
             )
@@ -371,6 +378,23 @@ class VacancyAnalyzer:
                 "frontend developer consumes APIs or communicates with "
                 "backend developers, that alone does not make it fullstack. "
 
+                "SENIORITY RULES: "
+
+                "Senior, senior-level, senior developer and сеньор are "
+                "acceptable target levels. Never reject a vacancy merely "
+                "because its title or description says Senior or сеньор. "
+
+                "Do not treat the requested years of experience, a senior "
+                "grade or senior-level ownership as a mismatch by itself. "
+                "Evaluate such a vacancy by the same role, primary stack and "
+                "work-format rules as every other vacancy. "
+
+                "A Senior vacancy may be unsuitable only because of another "
+                "concrete rule, such as a non-frontend role, a non-Vue primary "
+                "stack, substantial fullstack duties or an explicit location "
+                "conflict. In that case the reason must name that concrete "
+                "mismatch and must not cite seniority. "
+
                 "LOCATION AND WORK-FORMAT RULES: "
 
                 "The candidate lives in Saint Petersburg. "
@@ -411,6 +435,17 @@ class VacancyAnalyzer:
                 "Return the requested schema only. "
 
                 "confidence must be a decimal number between 0.0 and 1.0. "
+
+                "Write reason in Russian using complete sentences. "
+
+                "For an unsuitable vacancy, reason must be a specific, "
+                "self-contained explanation of two to four sentences. Name "
+                "the decisive mismatch and the concrete vacancy evidence: "
+                "its actual role, primary stack, responsibilities, location "
+                "or work format. Explain how that conflicts with this search's "
+                "Vue frontend criteria. Do not use a generic label such as "
+                "'role mismatch', 'stack mismatch' or 'not suitable' without "
+                "that evidence. Do not list seniority as a rejection reason. "
 
                 "For suitable vacancies, add two to four concise Russian "
                 "fit_points using only these categories: "
@@ -567,6 +602,10 @@ class VacancyAnalyzer:
             "The candidate's real contact details are already supplied in "
             "candidate data. Use those exact values if contact information "
             "is needed. Never ask the user to fill anything in manually. "
+
+            "The portfolio URL must be present in EVERY cover letter contact "
+            "block exactly as supplied in candidate data. Never omit it, "
+            "shorten it or replace it with a placeholder. "
 
             "Do not invent links. "
 
@@ -781,12 +820,6 @@ class VacancyAnalyzer:
         )
 
         normalized = re.sub(
-            r"[ \t]*-[ \t]*",
-            " - ",
-            normalized,
-        )
-
-        normalized = re.sub(
             r"[ \t]+\n",
             "\n",
             normalized,
@@ -851,7 +884,8 @@ class VacancyAnalyzer:
             f"{CANDIDATE_FULL_NAME}\n"
             f"{CANDIDATE_PHONE}\n"
             f"{CANDIDATE_EMAIL}\n"
-            f"Telegram: {CANDIDATE_TELEGRAM}"
+            f"Telegram: {CANDIDATE_TELEGRAM}\n"
+            f"Портфолио: {CANDIDATE_PORTFOLIO}"
         )
 
         if not body:

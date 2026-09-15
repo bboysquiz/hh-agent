@@ -5,6 +5,8 @@ import logging
 import random
 import re
 import tempfile
+
+import httpx
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -61,6 +63,14 @@ class VacancyDetails:
     description: str = ""
     error: str = ""
     company_url: str = ""
+    location: str = ""
+    work_formats: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VacancyMetadata:
+    location: str = ""
+    work_formats: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -141,6 +151,93 @@ async def _interaction_reason(page: Any) -> str:
     return "response_control_unavailable"
 
 
+def _normalized_label(value: str) -> str:
+    return re.sub(r"\s+", " ", value.casefold().replace("ё", "е")).strip()
+
+
+def _is_saint_petersburg(value: str) -> bool:
+    normalized = _normalized_label(value)
+    markers = (
+        "санкт-петербург",
+        "санкт петербург",
+        "спб",
+        "saint petersburg",
+        "st. petersburg",
+        "st petersburg",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _is_broad_location(value: str) -> bool:
+    normalized = _normalized_label(value)
+    return normalized in {
+        "россия",
+        "russia",
+        "беларусь",
+        "belarus",
+        "казахстан",
+        "kazakhstan",
+        "узбекистан",
+        "uzbekistan",
+        "армения",
+        "armenia",
+        "грузия",
+        "georgia",
+    }
+
+
+def _parse_work_formats(text: str) -> set[str]:
+    normalized = _normalized_label(text)
+    formats: set[str] = set()
+
+    if any(token in normalized for token in ("удаленно", "remote")):
+        formats.add("REMOTE")
+    if any(token in normalized for token in ("гибрид", "hybrid")):
+        formats.add("HYBRID")
+    if any(
+        token in normalized
+        for token in (
+            "на месте работодателя",
+            "на месте",
+            "офис",
+            "office",
+            "on-site",
+            "on site",
+            "onsite",
+        )
+    ):
+        formats.add("ON_SITE")
+    if any(token in normalized for token in ("разъезд", "field work")):
+        formats.add("FIELD_WORK")
+
+    return formats
+
+
+def _location_work_format_rejection(
+    location: str,
+    work_formats: tuple[str, ...],
+) -> str:
+    formats = set(work_formats)
+
+    # Если HH явно предлагает удаленный формат, город не ограничиваем.
+    if "REMOTE" in formats:
+        return ""
+
+    requires_presence = bool(formats & {"ON_SITE", "HYBRID", "FIELD_WORK"})
+    if not requires_presence:
+        return ""
+
+    # Если локация не определена надежно, не отбрасываем вакансию только по этому признаку.
+    if not location or _is_broad_location(location):
+        return ""
+
+    if _is_saint_petersburg(location):
+        return ""
+
+    readable = ",".join(sorted(formats))
+    return f"location_work_format_mismatch:{location}:{readable}"
+
+
 async def classify_page(page: Any) -> PageState:
     try:
         checks = (
@@ -182,6 +279,160 @@ class HHClient:
     async def _delay(self) -> None:
         await self.sleep(
             self.settings.min_seconds_between_actions + random.uniform(0.5, 2.5)
+        )
+
+    async def _read_api_vacancy_metadata(
+        self,
+        summary: VacancySummary,
+    ) -> VacancyMetadata:
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                follow_redirects=True,
+                headers={
+                    "HH-User-Agent": "hh-ai-agent-local/1.0"
+                },
+            ) as client:
+                response = await client.get(
+                    f"https://api.hh.ru/vacancies/{summary.id}"
+                )
+
+            if response.status_code != 200:
+                logger.info(
+                    "vacancy_metadata_api_unavailable job_id=%s status=%s",
+                    summary.id,
+                    response.status_code,
+                )
+                return VacancyMetadata()
+
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return VacancyMetadata()
+
+            address = payload.get("address")
+            area = payload.get("area")
+
+            address_city = (
+                str(address.get("city") or "").strip()
+                if isinstance(address, dict)
+                else ""
+            )
+            area_name = (
+                str(area.get("name") or "").strip()
+                if isinstance(area, dict)
+                else ""
+            )
+            location = address_city or area_name
+
+            formats: set[str] = set()
+            raw_formats = payload.get("work_format")
+            if isinstance(raw_formats, list):
+                for item in raw_formats:
+                    if not isinstance(item, dict):
+                        continue
+                    format_id = str(item.get("id") or "").strip().upper()
+                    format_name = str(item.get("name") or "").strip()
+                    if format_id in {"REMOTE", "HYBRID", "ON_SITE", "FIELD_WORK"}:
+                        formats.add(format_id)
+                    formats.update(_parse_work_formats(format_name))
+
+            # Старые вакансии могут отдавать удаленный формат через deprecated schedule.
+            schedule = payload.get("schedule")
+            if isinstance(schedule, dict):
+                schedule_id = str(schedule.get("id") or "").strip().casefold()
+                schedule_name = str(schedule.get("name") or "").strip()
+                if schedule_id == "remote":
+                    formats.add("REMOTE")
+                formats.update(_parse_work_formats(schedule_name))
+
+            return VacancyMetadata(
+                location=location,
+                work_formats=tuple(sorted(formats)),
+            )
+        except Exception as exc:
+            logger.info(
+                "vacancy_metadata_api_failed job_id=%s error_type=%s",
+                summary.id,
+                type(exc).__name__,
+            )
+            return VacancyMetadata()
+
+    async def _read_dom_vacancy_metadata(
+        self,
+        page: Any,
+    ) -> VacancyMetadata:
+        location = ""
+        for selector in (
+            '[data-qa="vacancy-view-raw-address"]',
+            '[data-qa="vacancy-view-location"]',
+        ):
+            try:
+                value = await _visible_text(page, selector)
+            except Exception:
+                value = ""
+            if value:
+                location = value
+                break
+
+        formats: set[str] = set()
+        for selector in (
+            '[data-qa="vacancy-view-work-format"]',
+            '[data-qa="vacancy-view-work-formats"]',
+            '[data-qa="vacancy-view-employment-mode"]',
+        ):
+            try:
+                value = await _visible_text(page, selector)
+            except Exception:
+                value = ""
+            if value:
+                formats.update(_parse_work_formats(value))
+
+        # Fallback для текущей верстки HH, где формат может быть отдельным текстовым бейджем.
+        exact_markers = (
+            ("REMOTE", "Удалённо"),
+            ("REMOTE", "Удаленно"),
+            ("HYBRID", "Гибрид"),
+            ("ON_SITE", "На месте работодателя"),
+            ("FIELD_WORK", "Разъездной"),
+        )
+        for format_id, label in exact_markers:
+            try:
+                if await _any_visible(page.get_by_text(label, exact=True)):
+                    formats.add(format_id)
+            except Exception:
+                continue
+
+        return VacancyMetadata(
+            location=location,
+            work_formats=tuple(sorted(formats)),
+        )
+
+    async def _read_vacancy_metadata(
+        self,
+        page: Any,
+        summary: VacancySummary,
+    ) -> VacancyMetadata:
+        api_metadata = await self._read_api_vacancy_metadata(summary)
+        dom_metadata = await self._read_dom_vacancy_metadata(page)
+
+        location = api_metadata.location or dom_metadata.location
+        formats = tuple(
+            sorted(
+                set(api_metadata.work_formats)
+                | set(dom_metadata.work_formats)
+            )
+        )
+
+        logger.info(
+            "vacancy_metadata job_id=%s location=%r work_formats=%s",
+            summary.id,
+            location,
+            formats,
+        )
+
+        return VacancyMetadata(
+            location=location,
+            work_formats=formats,
         )
 
     async def ensure_login(self) -> bool:
@@ -427,6 +678,25 @@ class HHClient:
                     error=reason,
                 )
 
+            metadata = await self._read_vacancy_metadata(page, summary)
+            rejection = _location_work_format_rejection(
+                metadata.location,
+                metadata.work_formats,
+            )
+            if rejection:
+                logger.info(
+                    "vacancy_skipped job_id=%s reason=%s",
+                    summary.id,
+                    rejection,
+                )
+                return VacancyDetails(
+                    summary,
+                    PageState.RESPONSE_UNAVAILABLE,
+                    error=rejection,
+                    location=metadata.location,
+                    work_formats=metadata.work_formats,
+                )
+
             description = (
                 await page.locator('[data-qa="vacancy-description"]').inner_text()
             ).strip()
@@ -435,6 +705,25 @@ class HHClient:
                     summary,
                     PageState.PAGE_STRUCTURE_CHANGED,
                     error="vacancy description is empty",
+                    location=metadata.location,
+                    work_formats=metadata.work_formats,
+                )
+
+            # Передаем структурированные данные HH в AI вместе с описанием,
+            # чтобы модель не придумывала город или формат работы.
+            metadata_lines: list[str] = []
+            if metadata.location:
+                metadata_lines.append(f"Локация HH: {metadata.location}")
+            if metadata.work_formats:
+                metadata_lines.append(
+                    "Формат работы HH: " + ", ".join(metadata.work_formats)
+                )
+            if metadata_lines:
+                description = (
+                    "СТРУКТУРИРОВАННЫЕ ДАННЫЕ HH:\n"
+                    + "\n".join(metadata_lines)
+                    + "\n\nОПИСАНИЕ ВАКАНСИИ:\n"
+                    + description
                 )
 
             company_locator = page.locator('[data-qa="vacancy-company-name"]')
@@ -454,6 +743,8 @@ class HHClient:
                 company,
                 description,
                 company_url=company_url,
+                location=metadata.location,
+                work_formats=metadata.work_formats,
             )
         except Exception as exc:
             return VacancyDetails(

@@ -280,6 +280,63 @@ def test_approval_mode_records_pending_and_sends_actions(tmp_path: Path) -> None
     assert telegram.previews == [("job-1", True)]
 
 
+def test_search_cycle_analyzes_senior_vacancy_and_reports_detailed_rejection(
+    tmp_path: Path,
+) -> None:
+    app_settings = settings(tmp_path, "approval")
+    database = Database(app_settings.database_path)
+    database.init()
+    summary = VacancySummary(
+        "senior-1",
+        "Senior Vue-разработчик",
+        "https://example.com/vacancy/senior-1",
+        "Vue developer",
+    )
+    details = VacancyDetails(
+        summary,
+        PageState.VACANCY_LOADED,
+        "Example",
+        "Frontend-разработка на Vue 3.",
+    )
+    reason = (
+        "Основные обязанности включают существенную backend-разработку. "
+        "Поэтому позиция является fullstack, а не целевой Vue frontend-ролью."
+    )
+    analyzer = SequenceAnalyzer(
+        [
+            SuitabilityResult(
+                suitable=False,
+                confidence=0.3,
+                reason=reason,
+            )
+        ]
+    )
+    telegram = FakeTelegram()
+    hh_client = FakeHHClient(
+        details,
+        [VacancySearchResult([summary], 1, 0)],
+    )
+
+    run = asyncio.run(
+        run_search_cycle(
+            app_settings,
+            database,
+            hh_client,
+            analyzer,
+            telegram,
+            AgentControl(),
+            now_factory=lambda: NOW,
+        )
+    )
+
+    assert run.rejected_by_filter == 0
+    assert run.rejected_by_llm == 1
+    assert database.get(summary.id).llm_reason == reason
+    assert len(telegram.notifications) == 1
+    assert "отклонено ИИ: 1" in telegram.notifications[0]
+    assert f"ИИ-анализ: {reason}" in telegram.notifications[0]
+
+
 def test_browser_read_error_is_persisted_as_apply_failed(tmp_path: Path) -> None:
     app_settings = settings(tmp_path, "dry_run")
     database = Database(app_settings.database_path)

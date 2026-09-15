@@ -33,6 +33,7 @@ from version import __version__
 
 logger = logging.getLogger(__name__)
 ANALYSIS_MAX_ATTEMPTS = 3
+LLM_REJECTION_REASON_PREFIX = "llm_reason:"
 
 
 TITLE_FILTER_REASON_LABELS: dict[str, str] = {
@@ -104,6 +105,19 @@ def humanize_rejection_reason(reason: str) -> str:
 
     if reason_key == "llm_rejected":
         return "отклонено ИИ-анализом"
+
+    if reason_key.startswith(LLM_REJECTION_REASON_PREFIX):
+        explanation = " ".join(
+            raw_reason[
+                len(LLM_REJECTION_REASON_PREFIX):
+            ].split()
+        )
+
+        return (
+            f"ИИ-анализ: {explanation}"
+            if explanation
+            else "отклонено ИИ-анализом"
+        )
 
     if reason_key == "filter_rejected":
         return "не прошло фильтр по названию"
@@ -179,8 +193,8 @@ def format_reason_summary(
             humanize_error_reason(reason)
         ] += count
 
-    return ", ".join(
-        f"{reason} — {count}"
+    return "\n".join(
+        f"• {reason} — {count}"
         for reason, count in humanized_reasons.most_common(limit)
     )
 
@@ -223,7 +237,13 @@ class SearchRunStats:
 
         elif result.outcome == "rejected_by_llm":
             self.rejected_by_llm += 1
-            self.rejection_reasons["llm_rejected"] += 1
+            reason = " ".join(result.reason.split())
+            reason_key = (
+                f"{LLM_REJECTION_REASON_PREFIX}{reason}"
+                if reason
+                else "llm_rejected"
+            )
+            self.rejection_reasons[reason_key] += 1
 
         elif result.outcome == "telegram_card":
             self.telegram_cards += 1
@@ -712,9 +732,11 @@ async def run_search_cycle(
             "/resume после устранения причины."
         )
 
-    elif (
-        state == "completed"
-        and stats.telegram_cards == 0
+    elif state == "completed" and (
+        stats.telegram_cards == 0
+        or stats.rejected_by_filter > 0
+        or stats.rejected_by_llm > 0
+        or stats.error_count > 0
     ):
         reason_text = format_reason_summary(
             stats.rejection_reasons,
@@ -726,12 +748,14 @@ async def run_search_cycle(
             f"Цикл завершён: "
             f"найдено {stats.found_results}, "
             f"новых {stats.new_vacancies}, "
-            f"карточек: 0."
+            f"карточек: {stats.telegram_cards}, "
+            f"отклонено фильтром: {stats.rejected_by_filter}, "
+            f"отклонено ИИ: {stats.rejected_by_llm}."
         )
 
         if reason_text:
             notification += (
-                f"\nПричины: {reason_text}."
+                f"\nПричины:\n{reason_text}"
             )
 
     else:

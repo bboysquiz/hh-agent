@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import main as hh_main
+import cover_letter_compat  # noqa: F401  # local-model cover-letter body/signature compatibility
 import hh_dom_compat  # noqa: F401  # robust replay parser for current/late HH DOM
 import hh_replay_fallback  # noqa: F401  # API fallback after DOM compatibility fallback
 from people_enrichment_strict import PeopleEnricher, format_people_messages

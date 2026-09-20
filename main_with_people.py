@@ -1,21 +1,14 @@
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import main as hh_main
-import cover_letter_compat  # noqa: F401  # local-model cover-letter body/signature compatibility
-import hh_dom_compat  # noqa: F401  # robust replay parser for current/late HH DOM
+import cover_letter_compat  # noqa: F401  # local-model cover-letter compatibility
+import hh_dom_compat  # noqa: F401  # robust replay parser for current/archived HH DOM
 import hh_replay_fallback  # noqa: F401  # API fallback after DOM compatibility fallback
-from people_enrichment_strict import PeopleEnricher, format_people_messages
-import people_search_compat  # noqa: F401  # sanitize DDGS backend names for current releases
 from tg_bot import TelegramService
 
 
-logger = logging.getLogger(__name__)
-
-_ORIGINAL_SEND_PREVIEW = TelegramService.send_preview
-_ORIGINAL_STOP = TelegramService.stop
 _ORIGINAL_COMMAND_HANDLER = TelegramService._command_handler
 _PATCHED = False
 
@@ -70,71 +63,16 @@ async def _command_handler_with_long_diagnostics(
         await message.answer(chunk)
 
 
-async def _send_preview_with_people(
-    self: TelegramService,
-    vacancy: Any,
-    include_actions: bool,
-) -> None:
-    await _ORIGINAL_SEND_PREVIEW(self, vacancy, include_actions)
-
-    enricher: PeopleEnricher | None = getattr(self, "_people_enricher", None)
-    if enricher is None:
-        enricher = PeopleEnricher(self.settings, self.database)
-        setattr(self, "_people_enricher", enricher)
-
-    if not enricher.available:
-        if not getattr(self, "_people_enrichment_config_warned", False):
-            logger.warning(
-                "people_enrichment_disabled: set PEOPLE_ENRICHMENT_ENABLED=true"
-            )
-            setattr(self, "_people_enrichment_config_warned", True)
-        return
-
-    if enricher.report_was_sent(vacancy.id):
-        return
-
-    try:
-        people = await enricher.enrich_company(vacancy.company)
-        messages = format_people_messages(vacancy.title, vacancy.company, people)
-        for text in messages:
-            await self.bot.send_message(
-                chat_id=self.settings.tg_user_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        enricher.mark_report_sent(vacancy.id)
-    except Exception as exc:
-        logger.exception(
-            "people_enrichment_failed job_id=%s company=%r error=%s",
-            vacancy.id,
-            vacancy.company,
-            type(exc).__name__,
-        )
-
-
-async def _stop_with_people(self: TelegramService) -> None:
-    enricher: PeopleEnricher | None = getattr(self, "_people_enricher", None)
-    if enricher is not None:
-        try:
-            await enricher.close()
-        except Exception as exc:
-            logger.warning("people_enrichment_close_failed error=%s", type(exc).__name__)
-    await _ORIGINAL_STOP(self)
-
-
-def install_people_enrichment() -> None:
+def install_runtime_compat() -> None:
     global _PATCHED
     if _PATCHED:
         return
 
     TelegramService._command_handler = _command_handler_with_long_diagnostics  # type: ignore[method-assign]
-    TelegramService.send_preview = _send_preview_with_people  # type: ignore[method-assign]
-    TelegramService.stop = _stop_with_people  # type: ignore[method-assign]
     _PATCHED = True
 
 
-install_people_enrichment()
+install_runtime_compat()
 
 
 if __name__ == "__main__":

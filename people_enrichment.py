@@ -29,7 +29,7 @@ from llm.types import LLMRequest
 
 logger = logging.getLogger(__name__)
 EmploymentStatus = Literal["current", "former", "unknown"]
-USER_AGENT = "hh-agent-public-profile-enrichment/2.0"
+USER_AGENT = "hh-agent-public-profile-enrichment/3.0"
 
 TELEGRAM_URL_RE = re.compile(
     r"https?://(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})",
@@ -97,6 +97,39 @@ CURRENT_MARKERS = (
     "works at", "working at", "currently", "present", "по настоящее время",
     "работает сейчас", "работает в", "работаю в", "в настоящее время",
 )
+
+# Слова/названия, которые часто выглядят как ФИО в поисковой выдаче, но людьми не являются.
+NAME_STOPWORDS = {
+    "компания", "company", "хабр", "habr", "карьера", "карьере", "career",
+    "linkedin", "github", "behance", "setka", "сетка", "product", "manager",
+    "developer", "engineer", "designer", "frontend", "backend", "fullstack",
+    "vacancy", "вакансия", "вакансии", "открытые", "работа", "работы",
+    "recruiter", "hr", "head", "lead", "director", "teamlead", "team",
+    "support", "design", "software", "mobile", "ios", "android",
+}
+
+# Ссылки этих сервисов часто лежат в глобальном footer/header профилей и не
+# относятся к конкретному человеку. Их нельзя сохранять как портфолио.
+GENERIC_EXTERNAL_HOSTS = {
+    "itunes.apple.com", "apps.apple.com", "play.google.com",
+    "github.blog", "docs.github.com", "support.github.com", "githubstatus.com",
+    "about.gitlab.com", "help.behance.net", "adobe.com", "www.adobe.com",
+    "www.facebook.com", "facebook.com",
+}
+
+# Публичные аккаунты самих платформ, которые нельзя приписывать сотруднику.
+GENERIC_SOCIAL_USERNAMES = {
+    "habr", "habr_career", "career_habr", "habr_com", "github", "githubstatus",
+    "behance", "behanceofficial", "adobe", "dribbble", "linkedin", "setka",
+    "twitter", "x", "telegram",
+}
+
+GENERIC_RESOURCE_PATH_PREFIXES = {
+    "github": {"topics", "features", "marketplace", "collections", "orgs", "organizations", "apps", "settings", "login", "join"},
+    "behance": {"gallery", "search", "joblist", "galleries", "assets", "hire"},
+    "habr_career": {"companies", "vacancies", "courses", "rating", "articles", "salary", "education"},
+    "habr": {"ru", "en", "top", "flows", "hubs", "companies", "articles", "news"},
+}
 
 
 @dataclass(frozen=True)
@@ -203,7 +236,7 @@ class Config:
                     "PEOPLE_SEARCH_BACKENDS", "yandex,bing"
                 ).split(",")
                 if item.strip()
-            ) or ("yandex", "bing"),
+            ) or ("duckduckgo",),
             use_llm=b("PEOPLE_USE_LLM", True),
             search_delay=f("PEOPLE_SEARCH_DELAY_SECONDS", 0.35, 0.0, 3.0),
         )
@@ -472,7 +505,7 @@ class PeopleEnricher:
         output: list[Candidate] = []
         for person in parsed.people:
             name = " ".join(person.full_name.split())
-            if not looks_like_name(name):
+            if not looks_like_name(name, company):
                 continue
             evidence = tuple(
                 known_urls[u]
@@ -490,15 +523,24 @@ class PeopleEnricher:
             combined = f"{result.title} {result.description}"
             if company.casefold() not in combined.casefold():
                 continue
-            names = names_from_title(result.title) or NAME_RE.findall(result.description[:500])[:2]
+            if not candidate_source_url_ok(result.url):
+                continue
+
+            # В free/heuristic режиме берём ФИО только из начала title.
+            # Description часто содержит соседние результаты поисковика и даёт
+            # ложные сущности вроде «Компания Каргономика» / «Product Manager».
+            names = names_from_title(result.title, company)
             for name in names:
-                if not looks_like_name(name):
+                if not looks_like_name(name, company):
                     continue
                 status, _ = status_from_text(company, combined)
+                title = title_from_result(name, company, result.title)
+                if is_generic_title(title):
+                    title = ""
                 output.append(
                     Candidate(
                         name,
-                        title_from_result(name, company, result.title),
+                        title,
                         status,
                         (result.url,),
                     )
@@ -507,7 +549,7 @@ class PeopleEnricher:
 
     async def _enrich_person(self, company: str, candidate: Candidate) -> PersonProfile | None:
         queries = [
-            f'{quote(candidate.full_name)} {quote(company)} (LinkedIn OR GitHub OR Behance OR Habr OR Сетка OR Telegram OR portfolio)',
+            f'{quote(candidate.full_name)} {quote(company)} (LinkedIn OR GitHub OR Behance OR Habr OR Сетка OR portfolio)',
             f'{quote(candidate.full_name)} (site:github.com OR site:behance.net OR site:linkedin.com/in OR site:setka.ru OR site:career.habr.com OR site:habr.com)',
         ]
         results: list[SearchResult] = []
@@ -515,37 +557,49 @@ class PeopleEnricher:
         for query in queries:
             for item in await self.searcher.search(query):
                 url = normalize_url(item.url)
-                if url and url not in seen and result_matches_name(candidate.full_name, item):
-                    seen.add(url)
-                    results.append(item)
+                if not url or url in seen:
+                    continue
+                if not result_matches_name(candidate.full_name, item):
+                    continue
+                if not result_is_personal(candidate.full_name, item):
+                    continue
+                seen.add(url)
+                results.append(item)
 
         resources: dict[str, str] = {}
         evidence_urls = list(candidate.evidence_urls)
         evidence_texts: list[str] = []
-        telegram = ""
+
+        # Seed URL из discovery тоже учитываем, но только если это персональный
+        # профиль, а не страница компании/вакансии/главная страница сервиса.
+        for raw_url in candidate.evidence_urls:
+            kind = resource_kind(raw_url)
+            if kind and is_personal_resource_url(kind, raw_url):
+                resources.setdefault(kind, clean_url(raw_url))
+
         for item in results:
             kind = resource_kind(item.url)
             if kind:
-                resources.setdefault(kind, clean_url(item.url))
-            elif safe_url(item.url):
+                if is_personal_resource_url(kind, item.url):
+                    resources.setdefault(kind, clean_url(item.url))
+            elif safe_url(item.url) and not is_generic_external_url(item.url):
                 resources.setdefault("website", clean_url(item.url))
             evidence_urls.append(item.url)
             evidence_texts.append(f"{item.title}. {item.description}")
 
-            # Search engines sometimes merge snippets from several LinkedIn profiles.
-            # Never attribute a Telegram handle from such a mixed snippet to one person.
-            direct_tg = telegram_from_url(item.url)
-            if direct_tg:
-                telegram = telegram or direct_tg
-                resources.setdefault("telegram", direct_tg)
-            elif trustworthy_person_snippet(candidate.full_name, item):
-                snippet_tg = telegram_from_text(
-                    f"{item.title} {item.description} {item.url}"
-                )
-                if snippet_tg:
-                    telegram = telegram or snippet_tg
-                    resources.setdefault("telegram", snippet_tg)
-        queue = [(url, 0) for url in [*resources.values(), *candidate.evidence_urls] if should_crawl(url)]
+        # Не извлекаем Telegram из объединённых search snippets. Bing и другие
+        # движки иногда склеивают несколько LinkedIn-профилей в один body.
+        # Telegram принимаем только с identity-verified страницы либо из
+        # отдельного точного Telegram-search ниже.
+        telegram = ""
+
+        seed_urls = [*resources.values()]
+        for raw_url in candidate.evidence_urls:
+            kind = resource_kind(raw_url)
+            if kind and is_personal_resource_url(kind, raw_url):
+                seed_urls.append(raw_url)
+
+        queue = [(url, 0) for url in seed_urls if should_crawl(url)]
         visited: set[str] = set()
         pages = 0
 
@@ -560,50 +614,99 @@ class PeopleEnricher:
                 continue
             final_url, text, links = page
             pages += 1
+
+            # Критично: footer/nav платформы нельзя считать данными человека.
+            # Ссылки и Telegram берём только если сама страница подтверждает ФИО.
+            if not page_mentions_person(candidate.full_name, text):
+                logger.debug(
+                    "people_page_identity_mismatch person=%r url=%s",
+                    candidate.full_name,
+                    final_url,
+                )
+                continue
+
             evidence_urls.append(final_url)
             if company.casefold() in text.casefold():
-                evidence_texts.append(text[:2500])
-            telegram = telegram or telegram_from_text(text)
+                evidence_texts.append(text[:3500])
+
+            if not telegram:
+                tg = telegram_from_text(text)
+                if tg and telegram_is_personal_candidate(tg):
+                    telegram = tg
+                    resources.setdefault("telegram", tg)
 
             for href in links:
                 target = normalize_url(urljoin(final_url, href))
                 if not target:
                     continue
+
                 if tg := telegram_from_url(target):
-                    telegram = telegram or tg
-                    resources.setdefault("telegram", tg)
+                    if telegram_is_personal_candidate(tg):
+                        telegram = telegram or tg
+                        resources.setdefault("telegram", tg)
                     continue
-                if kind := resource_kind(target):
-                    resources.setdefault(kind, clean_url(target))
+
+                kind = resource_kind(target)
+                if kind:
+                    if is_personal_resource_url(kind, target):
+                        resources.setdefault(kind, clean_url(target))
+                        if depth < self.config.crawl_depth and should_crawl(target):
+                            queue.append((target, depth + 1))
                     continue
+
+                if is_generic_external_url(target):
+                    continue
+
                 if depth < self.config.crawl_depth and likely_contact_or_external(final_url, target):
                     resources.setdefault("website", clean_url(target))
                     if should_crawl(target):
                         queue.append((target, depth + 1))
 
         if not telegram:
-            for item in await self.searcher.search(
-                f'{quote(candidate.full_name)} (Telegram OR телеграм OR t.me)'
-            ):
-                if not result_matches_name(candidate.full_name, item):
-                    continue
-                direct_tg = telegram_from_url(item.url)
-                snippet_tg = (
-                    telegram_from_text(f"{item.title} {item.description} {item.url}")
-                    if trustworthy_person_snippet(candidate.full_name, item)
-                    else ""
-                )
-                telegram = direct_tg or snippet_tg
-                if telegram:
-                    resources.setdefault("telegram", telegram)
+            telegram_queries = [
+                f'{quote(candidate.full_name)} {quote(company)} Telegram',
+                f'{quote(candidate.full_name)} {quote(company)} t.me',
+            ]
+            for query in telegram_queries:
+                found = False
+                for item in await self.searcher.search(query):
+                    if not result_matches_name(candidate.full_name, item):
+                        continue
+                    if result_has_merged_people_noise(item):
+                        continue
+
+                    # Самый надёжный search-case — результат ведёт прямо на t.me.
+                    tg = telegram_from_url(item.url)
+                    if not tg and result_is_clean_person_result(candidate.full_name, item):
+                        tg = telegram_from_text(f"{item.title} {item.description}")
+                    if not tg or not telegram_is_personal_candidate(tg):
+                        continue
+
+                    telegram = tg
+                    resources.setdefault("telegram", tg)
                     evidence_urls.append(item.url)
+                    found = True
+                    break
+                if found:
                     break
 
         status, note = best_status(company, candidate.employment_status, evidence_texts)
         title = candidate.title or first_title(candidate.full_name, company, results)
+        if is_generic_title(title):
+            title = ""
+
         resource_list = tuple(
-            ResourceLink(kind, url) for kind, url in sorted_resources(resources)
+            ResourceLink(kind, url)
+            for kind, url in sorted_resources(resources)
+            if resource_is_safe_for_output(kind, url)
         )
+
+        # Не отправляем «человека», если после строгой проверки у него нет ни
+        # одного персонального ресурса. Это отсекает Company/Habr/Product Manager.
+        personal_non_tg = [x for x in resource_list if x.kind != "telegram"]
+        if not personal_non_tg and not telegram:
+            return None
+
         return PersonProfile(
             full_name=candidate.full_name,
             title=title or "не удалось определить",
@@ -696,22 +799,192 @@ def quote(value: str) -> str:
 
 
 def company_key(value: str) -> str:
-    return "ddgs-v2:" + " ".join(value.casefold().split())
+    return "ddgs-v3:" + " ".join(value.casefold().split())
 
 
 def normalize_name(value: str) -> str:
     return re.sub(r"[^a-zа-яё0-9]+", " ", value.casefold()).strip()
 
 
-def looks_like_name(value: str) -> bool:
+def _words(value: str) -> list[str]:
+    return [x for x in normalize_name(value).split() if x]
+
+
+def looks_like_name(value: str, company: str = "") -> bool:
     parts = value.split()
-    return 2 <= len(parts) <= 4 and all(len(x) >= 2 for x in parts)
+    if not (2 <= len(parts) <= 4):
+        return False
+    if not all(len(x.strip(".'’")) >= 2 for x in parts):
+        return False
+
+    normalized_parts = _words(value)
+    if any(part in NAME_STOPWORDS for part in normalized_parts):
+        return False
+
+    # Не принимаем название компании или кусок названия компании за ФИО.
+    company_parts = {x for x in _words(company) if len(x) >= 4}
+    if company_parts and len(set(normalized_parts) & company_parts) >= 1:
+        # Для реального ФИО совпадение с названием компании крайне редко;
+        # precision здесь важнее recall.
+        return False
+
+    # Должны быть именно словесные токены, а не фразы вида UI/UX, Product 123.
+    return all(re.fullmatch(r"[A-Za-zА-Яа-яЁё'’.-]+", part) for part in parts)
 
 
-def names_from_title(title: str) -> list[str]:
-    title = re.sub(r"\s*[|·]\s*(LinkedIn|GitHub|Behance|Сетка|Habr.*)$", "", title, flags=re.I)
-    first = re.split(r"\s+[—–-]\s+", title, maxsplit=1)[0].strip()
-    return [first] if NAME_RE.fullmatch(first) else []
+def names_from_title(title: str, company: str = "") -> list[str]:
+    cleaned = re.sub(
+        r"\s*[|·]\s*(LinkedIn|GitHub|Behance|Сетка|Setka|Habr.*)$",
+        "",
+        title,
+        flags=re.I,
+    )
+    first = re.split(r"\s+[—–-]\s+", cleaned, maxsplit=1)[0].strip()
+    if not NAME_RE.fullmatch(first):
+        return []
+    return [first] if looks_like_name(first, company) else []
+
+
+def _path_parts(url: str) -> list[str]:
+    return [x for x in urlparse(url).path.split("/") if x]
+
+
+def candidate_source_url_ok(url: str) -> bool:
+    kind = resource_kind(url)
+    if not kind:
+        return False
+    return is_personal_resource_url(kind, url)
+
+
+def is_personal_resource_url(kind: str, url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    parts = _path_parts(url)
+    if not parts:
+        return False
+
+    if kind == "linkedin":
+        return len(parts) >= 2 and parts[0].casefold() == "in"
+
+    if kind == "github":
+        return len(parts) == 1 and parts[0].casefold() not in GENERIC_RESOURCE_PATH_PREFIXES["github"]
+
+    if kind == "behance":
+        return len(parts) == 1 and parts[0].casefold() not in GENERIC_RESOURCE_PATH_PREFIXES["behance"]
+
+    if kind == "habr_career":
+        return len(parts) == 1 and parts[0].casefold() not in GENERIC_RESOURCE_PATH_PREFIXES["habr_career"]
+
+    if kind == "habr":
+        lowered = [x.casefold() for x in parts]
+        if "users" in lowered:
+            idx = lowered.index("users")
+            return len(parts) > idx + 1
+        return False
+
+    if kind == "setka":
+        lowered = [x.casefold() for x in parts]
+        if lowered[0] in {"networks", "companies", "company", "search", "vacancies", "jobs"}:
+            return False
+        return True
+
+    if kind in {"x", "dribbble", "medium", "vc"}:
+        username = parts[0].lstrip("@").casefold()
+        return len(parts) >= 1 and username not in GENERIC_SOCIAL_USERNAMES
+
+    if kind == "stackoverflow":
+        return len(parts) >= 2 and parts[0].casefold() == "users"
+
+    if kind == "telegram":
+        return telegram_is_personal_candidate(url)
+
+    return bool(host and parts)
+
+
+def is_generic_external_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    if host in GENERIC_EXTERNAL_HOSTS or any(host.endswith("." + x) for x in GENERIC_EXTERNAL_HOSTS):
+        return True
+    return False
+
+
+def is_generic_title(value: str) -> bool:
+    text = normalize_name(value)
+    if not text:
+        return True
+    words = set(text.split())
+    generic = {
+        "linkedin", "github", "behance", "хабр", "habr", "карьера", "career",
+        "вакансия", "вакансии", "открытые", "company", "компания",
+    }
+    return words.issubset(generic) or text in {"linkedin", "github", "behance", "хабр карьера"}
+
+
+def page_mentions_person(name: str, text: str) -> bool:
+    name_tokens = [x for x in _words(name) if len(x) >= 2]
+    haystack = normalize_name(text[:12000])
+    if len(name_tokens) < 2:
+        return False
+    # Имя и фамилия должны встретиться на одной странице.
+    return all(token in haystack for token in (name_tokens[0], name_tokens[-1]))
+
+
+def result_has_merged_people_noise(result: SearchResult) -> bool:
+    blob = f"{result.title} {result.description}"
+    low = blob.casefold()
+    # Типичный Bing-case: несколько LinkedIn-карточек склеены подряд.
+    if low.count("linkedin") >= 3:
+        return True
+    if len(re.findall(r"[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё'’-]+\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё'’-]+", blob)) >= 5:
+        return True
+    return False
+
+
+def result_is_clean_person_result(name: str, result: SearchResult) -> bool:
+    if result_has_merged_people_noise(result):
+        return False
+    title_name = names_from_title(result.title)
+    if title_name and normalize_name(title_name[0]) == normalize_name(name):
+        return True
+    # Для прямого t.me result title может отличаться; тогда требуем точную
+    # нормализованную фразу имени в title/body.
+    full = normalize_name(name)
+    return full in normalize_name(f"{result.title} {result.description}")
+
+
+def result_is_personal(name: str, result: SearchResult) -> bool:
+    if result_has_merged_people_noise(result):
+        # Ссылку на профиль можно сохранить, только если URL сам персональный и
+        # title начинается с нужного ФИО. Body в таком случае не используем для TG.
+        kind = resource_kind(result.url)
+        title_names = names_from_title(result.title)
+        return bool(
+            kind
+            and is_personal_resource_url(kind, result.url)
+            and title_names
+            and normalize_name(title_names[0]) == normalize_name(name)
+        )
+
+    kind = resource_kind(result.url)
+    if kind:
+        return is_personal_resource_url(kind, result.url) and result_matches_name(name, result)
+
+    return result_matches_name(name, result) and not is_generic_external_url(result.url)
+
+
+def telegram_is_personal_candidate(url: str) -> bool:
+    tg = telegram_from_url(url)
+    if not tg:
+        return False
+    username = urlparse(tg).path.strip("/").casefold()
+    return username not in GENERIC_SOCIAL_USERNAMES
+
+
+def resource_is_safe_for_output(kind: str, url: str) -> bool:
+    if kind == "website":
+        return not is_generic_external_url(url)
+    return is_personal_resource_url(kind, url)
 
 
 def title_from_result(name: str, company: str, title: str) -> str:
@@ -763,35 +1036,12 @@ def dedupe_candidates(items: list[Candidate]) -> list[Candidate]:
     return list(best.values())
 
 
-
-def trustworthy_person_snippet(name: str, result: SearchResult) -> bool:
-    """Return True only for a search snippet that looks dedicated to one person.
-
-    Bing can concatenate several LinkedIn cards into one result. Those snippets are
-    useful for discovery, but unsafe for attributing a Telegram handle to a person.
-    """
-    wanted = normalize_name(name)
-    title = normalize_name(result.title)
-    if not wanted or not title.startswith(wanted):
-        return False
-
-    raw_title = result.title.casefold()
-    raw_body = result.description.casefold()
-
-    # Multiple LinkedIn markers are a strong signal that the engine merged profiles.
-    if raw_title.count("linkedin") > 1 or raw_body.count("linkedin") > 2:
-        return False
-
-    # A long chain of profile separators is another common merged-result pattern.
-    if result.title.count("|") >= 3:
-        return False
-
-    return True
-
 def result_matches_name(name: str, result: SearchResult) -> bool:
-    haystack = normalize_name(f"{result.title} {result.description} {result.url}")
-    tokens = [x for x in normalize_name(name).split() if len(x) > 2]
-    return bool(tokens) and tokens[0] in haystack and tokens[-1] in haystack
+    haystack = normalize_name(f"{result.title} {result.description}")
+    tokens = [x for x in _words(name) if len(x) > 1]
+    if len(tokens) < 2:
+        return False
+    return tokens[0] in haystack and tokens[-1] in haystack
 
 
 def status_from_text(company: str, text: str) -> tuple[EmploymentStatus, str]:
@@ -803,8 +1053,20 @@ def status_from_text(company: str, text: str) -> tuple[EmploymentStatus, str]:
         return "former", "есть явный признак прошлого места работы"
     if any(x in text for x in CURRENT_MARKERS):
         return "current", "есть явный признак текущего места работы"
-    if any(x in text for x in (f" at {company_cf}", f" в {company_cf}", f" @ {company_cf}")):
-        return "current", "публичный профиль указывает роль в этой компании"
+    if any(
+        x in text
+        for x in (
+            f" at {company_cf}",
+            f" в {company_cf}",
+            f" @ {company_cf}",
+            f" - {company_cf}",
+            f" — {company_cf}",
+            f" | {company_cf}",
+            f"experience: {company_cf}",
+            f"опыт работы: {company_cf}",
+        )
+    ):
+        return "current", "публичный профиль указывает текущую роль/опыт в этой компании"
     return "unknown", "публичных данных недостаточно для надёжного вывода"
 
 
@@ -928,9 +1190,12 @@ def telegram_from_url(url: str) -> str:
 
 def telegram_from_text(text: str) -> str:
     if tg := telegram_from_url(text):
-        return tg
+        return tg if telegram_is_personal_candidate(tg) else ""
     match = TELEGRAM_TEXT_RE.search(text)
-    return f"https://t.me/{match.group(1)}" if match else ""
+    if not match:
+        return ""
+    tg = f"https://t.me/{match.group(1)}"
+    return tg if telegram_is_personal_candidate(tg) else ""
 
 
 def likely_contact_or_external(source: str, target: str) -> bool:

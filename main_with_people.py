@@ -8,6 +8,7 @@ import cover_letter_compat  # noqa: F401  # local-model cover-letter body/signat
 import hh_dom_compat  # noqa: F401  # robust replay parser for current/late HH DOM
 import hh_replay_fallback  # noqa: F401  # API fallback after DOM compatibility fallback
 from people_enrichment_strict import PeopleEnricher, format_people_messages
+import people_search_compat  # noqa: F401  # sanitize DDGS backend names for current releases
 from tg_bot import TelegramService
 
 

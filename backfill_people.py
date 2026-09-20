@@ -11,6 +11,7 @@ from aiogram import Bot
 from config import ConfigError, load_settings
 from database import Database
 from people_enrichment_strict import PeopleEnricher, format_people_messages
+import people_search_compat  # noqa: F401  # sanitize DDGS backend names for current releases
 
 
 logger = logging.getLogger("backfill_people")

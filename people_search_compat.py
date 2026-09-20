@@ -18,7 +18,7 @@ import people_enrichment as base
 logger = logging.getLogger(__name__)
 
 # Backends advertised by the currently supported DDGS generation. We prefer
-# DuckDuckGo and Yahoo because the others commonly require API keys or return
+# Yahoo and DuckDuckGo because the others commonly require API keys or return
 # CAPTCHA/rate-limit pages in this workflow.
 SUPPORTED_BACKENDS = {
     "brave",
@@ -30,7 +30,7 @@ SUPPORTED_BACKENDS = {
     "wikipedia",
     "yahoo",
 }
-PREFERRED_BACKENDS = ("duckduckgo", "yahoo")
+PREFERRED_BACKENDS = ("yahoo", "duckduckgo")
 
 _ORIGINAL_INIT = base.DdgsSearch.__init__
 _PATCHED = False

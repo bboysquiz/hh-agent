@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import main as hh_main
+import hh_replay_fallback  # noqa: F401  # install replay fallback for old discovered vacancies
 from people_enrichment_strict import PeopleEnricher, format_people_messages
 from tg_bot import TelegramService
 
@@ -71,7 +72,6 @@ async def _send_preview_with_people(
     vacancy: Any,
     include_actions: bool,
 ) -> None:
-    # First send the normal vacancy card immediately.
     await _ORIGINAL_SEND_PREVIEW(self, vacancy, include_actions)
 
     enricher: PeopleEnricher | None = getattr(self, "_people_enricher", None)
@@ -102,7 +102,6 @@ async def _send_preview_with_people(
             )
         enricher.mark_report_sent(vacancy.id)
     except Exception as exc:
-        # Enrichment failures must never break the existing HH -> Telegram flow.
         logger.exception(
             "people_enrichment_failed job_id=%s company=%r error=%s",
             vacancy.id,
